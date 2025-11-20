@@ -1,9 +1,6 @@
 /* src/crossword.c
  *
- * Rewritten crossword implementation (ASCII Option A).
- * Assumes header is available at ../include/crossword.h when compiling from src/.
- *
- * All state is stored in Puzzle; positions[] is dynamically grown with realloc.
+ * Linked-list positions, undo stack, and BST dictionary integration.
  */
 
 #include "../include/crossword.h"
@@ -15,7 +12,6 @@
 
 /* ----------------- Platform helper ----------------- */
 
-/* Cross-platform clear screen */
 void clear_screen(void) {
 #ifdef _WIN32
     (void)system("cls");
@@ -26,7 +22,6 @@ void clear_screen(void) {
 
 /* ----------------- Utilities ----------------- */
 
-/* safe_gets defined in header; implement here */
 void safe_gets(char *buf, int size) {
     if (!buf || size <= 0) return;
     if (!fgets(buf, size, stdin)) {
@@ -38,33 +33,139 @@ void safe_gets(char *buf, int size) {
     if (ln < (size_t)size) buf[ln] = '\0';
 }
 
-/* uppercase in-place */
 void to_upper_inplace(char *s) {
     if (!s) return;
     for (size_t i = 0; s[i]; ++i) s[i] = (char) toupper((unsigned char)s[i]);
 }
 
+/* ----------------- Move stack operations ----------------- */
+
+void push_move(MoveStack *s, Move mv) {
+    if (!s) return;
+    MoveStackNode *n = (MoveStackNode *) malloc(sizeof(MoveStackNode));
+    if (!n) return;
+    n->mv = mv;
+    n->next = s->top;
+    s->top = n;
+    s->size++;
+}
+
+bool pop_move(MoveStack *s, Move *out) {
+    if (!s || !s->top) return false;
+    MoveStackNode *n = s->top;
+    if (out) *out = n->mv;
+    s->top = n->next;
+    free(n);
+    s->size--;
+    return true;
+}
+
+/* Undo last user move: restore previous char in user grid */
+void undo_last_move(Puzzle *p) {
+    if (!p) return;
+    Move mv;
+    if (!pop_move(&p->undo_stack, &mv)) {
+        printf("%sNo moves to undo.%s\n", YELLOW, RESET);
+        return;
+    }
+    if (mv.row >= 0 && mv.row < GRID_SIZE && mv.col >= 0 && mv.col < GRID_SIZE) {
+        p->user[mv.row][mv.col] = mv.prev;
+        printf("%sUndid move at [%d,%d].%s\n", CYAN, mv.row, mv.col, RESET);
+    }
+}
+
+/* ----------------- BST Dictionary ----------------- */
+
+BSTNode *bst_new_node(const char *word) {
+    BSTNode *n = (BSTNode *) malloc(sizeof(BSTNode));
+    if (!n) return NULL;
+    n->left = n->right = NULL;
+    strncpy(n->word, word, MAX_WORD_LENGTH-1);
+    n->word[MAX_WORD_LENGTH-1] = '\0';
+    return n;
+}
+
+/* BST insert (no duplicates - case sensitive expected uppercase) */
+BSTNode *bst_insert(BSTNode *root, const char *word) {
+    if (!word || !word[0]) return root;
+    if (!root) return bst_new_node(word);
+    int cmp = strcmp(word, root->word);
+    if (cmp < 0) root->left = bst_insert(root->left, word);
+    else if (cmp > 0) root->right = bst_insert(root->right, word);
+    /* equal -> skip */
+    return root;
+}
+
+void bst_free(BSTNode *root) {
+    if (!root) return;
+    bst_free(root->left);
+    bst_free(root->right);
+    free(root);
+}
+
+int bst_count(BSTNode *root) {
+    if (!root) return 0;
+    return 1 + bst_count(root->left) + bst_count(root->right);
+}
+
+/* Collect words in-order (lexicographically ascending) into out[] */
+void bst_inorder_collect(BSTNode *root, char **out, int *idx, int max) {
+    if (!root || !out || !idx || *idx >= max) return;
+    bst_inorder_collect(root->left, out, idx, max);
+    if (*idx < max) {
+        out[*idx] = root->word;
+        (*idx)++;
+    }
+    bst_inorder_collect(root->right, out, idx, max);
+}
+
+/* Populate default dictionary into BST */
+void populate_default_dictionary(Puzzle *p) {
+    if (!p) return;
+    /* default list uppercase */
+    const char *defs[] = {
+        "QUEUE", "STACK", "GRAPH", "ALGORITHM", "SEARCH", "SORT",
+        "TREE", "NODE", "ARRAY", "DATA", "PAINT", "ROBOT",
+        "NOISE", "OFFER", "ASSET", "COURT", "STEEP", "PYTHON"
+    };
+    int n = (int)(sizeof(defs)/sizeof(defs[0]));
+    for (int i = 0; i < n; ++i) p->dict_root = bst_insert(p->dict_root, defs[i]);
+}
+
 /* ----------------- Puzzle lifecycle ----------------- */
 
-/* Allocate puzzle instance */
 Puzzle *puzzle_create(void) {
     Puzzle *p = (Puzzle *) calloc(1, sizeof(Puzzle));
     if (!p) return NULL;
-    p->positions = NULL;
+    p->positions_head = NULL;
     p->word_count = 0;
     p->clue_counter = 1;
     p->start_time = time(NULL);
+    p->undo_stack.top = NULL;
+    p->undo_stack.size = 0;
+    p->dict_root = NULL;
+    /* populate dictionary */
+    populate_default_dictionary(p);
     return p;
 }
 
-/* Free puzzle instance */
 void puzzle_free(Puzzle *p) {
     if (!p) return;
-    free(p->positions);
+    /* free linked list */
+    WordNode *cur = p->positions_head;
+    while (cur) {
+        WordNode *nx = cur->next;
+        free(cur);
+        cur = nx;
+    }
+    /* free BST */
+    bst_free(p->dict_root);
+    /* free undo stack */
+    Move mv;
+    while (pop_move(&p->undo_stack, &mv)) { /* pop until empty */ }
     free(p);
 }
 
-/* Initialize/reset puzzle grid and counters */
 bool puzzle_init(Puzzle *p) {
     if (!p) return false;
     for (int r = 0; r < GRID_SIZE; ++r)
@@ -73,15 +174,19 @@ bool puzzle_init(Puzzle *p) {
             p->user[r][c] = ' ';
             p->owner[r][c] = 0;
         }
-    free(p->positions);
-    p->positions = NULL;
+    /* free linked list */
+    WordNode *cur = p->positions_head;
+    while (cur) { WordNode *nx = cur->next; free(cur); cur = nx; }
+    p->positions_head = NULL;
     p->word_count = 0;
     p->clue_counter = 1;
     p->start_time = time(NULL);
+    /* clear undo stack */
+    Move mv;
+    while (pop_move(&p->undo_stack, &mv)) {}
     return true;
 }
 
-/* Create user grid with '_' placeholders for letter cells */
 void puzzle_create_user_grid(Puzzle *p) {
     if (!p) return;
     for (int r = 0; r < GRID_SIZE; ++r)
@@ -91,7 +196,7 @@ void puzzle_create_user_grid(Puzzle *p) {
 
 /* ----------------- Placement logic ----------------- */
 
-/* comparator for qsort by descending length */
+/* comparator for earlier qsort usage retained for small arrays (not used now) */
 static int cmp_len_desc(const void *a, const void *b) {
     const char * const *pa = (const char * const *)a;
     const char * const *pb = (const char * const *)b;
@@ -138,59 +243,66 @@ bool puzzle_can_place(Puzzle *p, const char *w, int r, int c, char d) {
     return true;
 }
 
-/* Place the word into grid and append a WordPos record; returns true on success */
+/* Append WordPos via linked list node and place letters */
 bool puzzle_place_word_record(Puzzle *p, const char *w, int r, int c, char d) {
     if (!p || !w) return false;
     if (!puzzle_can_place(p, w, r, c, d)) return false;
 
-    WordPos *new_arr = (WordPos *) realloc(p->positions, (size_t)(p->word_count + 1) * sizeof(WordPos));
-    if (!new_arr) return false;
-    p->positions = new_arr;
-
+    /* place letters */
     int L = (int)strlen(w);
     if (d == 'A') {
         for (int i = 0; i < L; ++i) {
             p->sol[r][c+i] = w[i];
             p->owner[r][c+i] |= OWNER_ACROSS;
         }
-    } else { /* 'D' */
+    } else {
         for (int i = 0; i < L; ++i) {
             p->sol[r+i][c] = w[i];
             p->owner[r+i][c] |= OWNER_DOWN;
         }
     }
 
-    WordPos *wp = &p->positions[p->word_count];
-    strncpy(wp->word, w, MAX_WORD_LENGTH - 1);
-    wp->word[MAX_WORD_LENGTH - 1] = '\0';
-    wp->row = r;
-    wp->col = c;
-    wp->direction = d;
-    wp->clue_num = p->clue_counter++;
-    wp->hint_used = false;
+    /* create linked list node */
+    WordNode *n = (WordNode *) malloc(sizeof(WordNode));
+    if (!n) return false;
+    strncpy(n->data.word, w, MAX_WORD_LENGTH-1);
+    n->data.word[MAX_WORD_LENGTH-1] = '\0';
+    n->data.row = r; n->data.col = c; n->data.direction = d;
+    n->data.clue_num = p->clue_counter++;
+    n->data.hint_used = false;
+    n->next = NULL;
 
+    /* append to tail for stable ordering */
+    if (!p->positions_head) {
+        p->positions_head = n;
+    } else {
+        WordNode *cur = p->positions_head;
+        while (cur->next) cur = cur->next;
+        cur->next = n;
+    }
     p->word_count++;
     return true;
 }
 
-/* Find an intersection placement for w; if found set out_r/out_c/out_d and return 1 */
+/* Find an intersection using linked list iteration */
 int puzzle_find_intersection(Puzzle *p, const char *w, int *out_r, int *out_c, char *out_d) {
     if (!p || !w) return 0;
     int Lw = (int)strlen(w);
-    for (int k = 0; k < p->word_count; ++k) {
-        WordPos *wp = &p->positions[k];
-        int L2 = (int)strlen(wp->word);
+    WordNode *cur = p->positions_head;
+    while (cur) {
+        const char *placed = cur->data.word;
+        int L2 = (int)strlen(placed);
         for (int i = 0; i < Lw; ++i) {
             for (int j = 0; j < L2; ++j) {
-                if (w[i] != wp->word[j]) continue;
+                if (w[i] != placed[j]) continue;
                 int nr, nc; char nd;
-                if (wp->direction == 'A') {
-                    nr = wp->row - i;
-                    nc = wp->col + j;
+                if (cur->data.direction == 'A') {
+                    nr = cur->data.row - i;
+                    nc = cur->data.col + j;
                     nd = 'D';
                 } else {
-                    nr = wp->row + j;
-                    nc = wp->col - i;
+                    nr = cur->data.row + j;
+                    nc = cur->data.col - i;
                     nd = 'A';
                 }
                 if (nr < 0 || nc < 0 || nr >= GRID_SIZE || nc >= GRID_SIZE) continue;
@@ -202,22 +314,40 @@ int puzzle_find_intersection(Puzzle *p, const char *w, int *out_r, int *out_c, c
                 }
             }
         }
+        cur = cur->next;
     }
     return 0;
 }
 
-/* ----------------- Puzzle generation ----------------- */
+/* ----------------- Puzzle generation using BST as source ----------------- */
 
-/* Generate puzzle: words[] are NUL-terminated uppercase strings, count is number of pointers.
-   Returns true if at least one word placed successfully. */
+/* Create temporary list of words from BST, sort by length descending implicitly by qsort
+   (we collect lexicographic order from BST and then qsort by length). */
+bool puzzle_generate_from_bst(Puzzle *p) {
+    if (!p) return false;
+    int n = bst_count(p->dict_root);
+    if (n <= 0) return false;
+    /* collect words */
+    char **arr = (char **) malloc(sizeof(char *) * n);
+    if (!arr) return false;
+    int idx = 0;
+    bst_inorder_collect(p->dict_root, arr, &idx, n);
+    /* We have lexicographic list in arr; now sort by length descending */
+    qsort(arr, (size_t)n, sizeof(char *), cmp_len_desc);
+    bool ok = puzzle_generate(p, arr, n);
+    free(arr);
+    return ok;
+}
+
+/* Original generator takes word pointers array — we reuse it */
 bool puzzle_generate(Puzzle *p, char **words, int count) {
     if (!p || !words || count <= 0) return false;
 
-    /* gather valid words pointers */
+    /* gather valid words pointers (defensive) */
     char **tmp = (char **) malloc((size_t)count * sizeof(char *));
     if (!tmp) return false;
     int wc = 0;
-    for (int i = 0; i < count && wc < MAX_WORDS; ++i) {
+    for (int i = 0; i < count && wc < count; ++i) {
         if (words[i] && words[i][0] != '\0') tmp[wc++] = words[i];
     }
     if (wc == 0) { free(tmp); return false; }
@@ -387,29 +517,33 @@ void draw_grid(const Puzzle *p, bool solution_view) {
 void show_clues(const Puzzle *p) {
     if (!p) return;
     printf("\n%sACROSS:%s\n", BOLD, RESET);
-    for (int i = 0; i < p->word_count; ++i) {
-        if (p->positions[i].direction == 'A') {
-            const char *w = p->positions[i].word;
+    WordNode *cur = p->positions_head;
+    while (cur) {
+        if (cur->data.direction == 'A') {
+            const char *w = cur->data.word;
             printf("%2d. %c...%c (%ld) at [%d,%d]%s\n",
-                   p->positions[i].clue_num,
+                   cur->data.clue_num,
                    w[0], w[strlen(w)-1],
                    (long) strlen(w),
-                   p->positions[i].row, p->positions[i].col,
-                   p->positions[i].hint_used ? " (hint used)" : "");
+                   cur->data.row, cur->data.col,
+                   cur->data.hint_used ? " (hint used)" : "");
         }
+        cur = cur->next;
     }
 
     printf("\n%sDOWN:%s\n", BOLD, RESET);
-    for (int i = 0; i < p->word_count; ++i) {
-        if (p->positions[i].direction == 'D') {
-            const char *w = p->positions[i].word;
+    cur = p->positions_head;
+    while (cur) {
+        if (cur->data.direction == 'D') {
+            const char *w = cur->data.word;
             printf("%2d. %c...%c (%ld) at [%d,%d]%s\n",
-                   p->positions[i].clue_num,
+                   cur->data.clue_num,
                    w[0], w[strlen(w)-1],
                    (long) strlen(w),
-                   p->positions[i].row, p->positions[i].col,
-                   p->positions[i].hint_used ? " (hint used)" : "");
+                   cur->data.row, cur->data.col,
+                   cur->data.hint_used ? " (hint used)" : "");
         }
+        cur = cur->next;
     }
     putchar('\n');
 }
@@ -418,22 +552,34 @@ void show_clues(const Puzzle *p) {
 
 bool input_answer(Puzzle *p, int clue, char d, const char *ans) {
     if (!p || !ans) return false;
-    for (int i = 0; i < p->word_count; ++i) {
-        if (p->positions[i].clue_num == clue && p->positions[i].direction == d) {
-            WordPos *wp = &p->positions[i];
+    WordNode *cur = p->positions_head;
+    while (cur) {
+        if (cur->data.clue_num == clue && cur->data.direction == d) {
+            WordPos *wp = &cur->data;
             int L = (int)strlen(wp->word);
             if ((int)strlen(ans) != L) {
                 printf("%sWrong length! Expected %d letters.%s\n", RED, L, RESET);
                 return false;
             }
             if (d == 'A') {
-                for (int k = 0; k < L; ++k) p->user[wp->row][wp->col + k] = ans[k];
+                for (int k = 0; k < L; ++k) {
+                    int rr = wp->row, cc = wp->col + k;
+                    Move mv = { rr, cc, p->user[rr][cc], ans[k] };
+                    push_move(&p->undo_stack, mv);
+                    p->user[rr][cc] = ans[k];
+                }
             } else {
-                for (int k = 0; k < L; ++k) p->user[wp->row + k][wp->col] = ans[k];
+                for (int k = 0; k < L; ++k) {
+                    int rr = wp->row + k, cc = wp->col;
+                    Move mv = { rr, cc, p->user[rr][cc], ans[k] };
+                    push_move(&p->undo_stack, mv);
+                    p->user[rr][cc] = ans[k];
+                }
             }
             printf("%sPlaced answer for clue %d %c.%s\n", GREEN, clue, d, RESET);
             return true;
         }
+        cur = cur->next;
     }
     printf("%sInvalid clue number/direction.%s\n", RED, RESET);
     return false;
@@ -441,29 +587,33 @@ bool input_answer(Puzzle *p, int clue, char d, const char *ans) {
 
 bool give_hint(Puzzle *p, int clue, char d) {
     if (!p) return false;
-    for (int i = 0; i < p->word_count; ++i) {
-        if (p->positions[i].clue_num == clue && p->positions[i].direction == d) {
-            WordPos *wp = &p->positions[i];
+    WordNode *cur = p->positions_head;
+    while (cur) {
+        if (cur->data.clue_num == clue && cur->data.direction == d) {
+            WordPos *wp = &cur->data;
             int L = (int)strlen(wp->word);
             int choices[MAX_WORD_LENGTH];
-            int cc = 0;
+            int ccnt = 0;
             for (int k = 0; k < L; ++k) {
                 int rr = wp->row + (d == 'D' ? k : 0);
                 int cc2 = wp->col + (d == 'A' ? k : 0);
-                if (p->user[rr][cc2] != p->sol[rr][cc2]) choices[cc++] = k;
+                if (p->user[rr][cc2] != p->sol[rr][cc2]) choices[ccnt++] = k;
             }
-            if (cc == 0) {
+            if (ccnt == 0) {
                 printf("%sAll letters already revealed for that clue.%s\n", YELLOW, RESET);
                 return true;
             }
-            int pick = choices[rand() % cc];
+            int pick = choices[rand() % ccnt];
             int rr = wp->row + (d == 'D' ? pick : 0);
             int cc2 = wp->col + (d == 'A' ? pick : 0);
+            Move mv = { rr, cc2, p->user[rr][cc2], p->sol[rr][cc2] };
+            push_move(&p->undo_stack, mv);
             p->user[rr][cc2] = p->sol[rr][cc2];
             wp->hint_used = true;
             printf("%sHint: revealed letter %d -> %c%s\n", CYAN, pick + 1, p->sol[rr][cc2], RESET);
             return true;
         }
+        cur = cur->next;
     }
     printf("%sInvalid clue for hint.%s\n", RED, RESET);
     return false;
@@ -495,7 +645,7 @@ float puzzle_completion(const Puzzle *p) {
 void show_timer(const Puzzle *p) {
     if (!p) return;
 
-    clear_screen();   // <--- refresh screen BEFORE printing timer
+    clear_screen();
 
     int sec = (int) difftime(time(NULL), p->start_time);
     printf("%sElapsed time: %02d:%02d%s\n", CYAN, sec / 60, sec % 60, RESET);

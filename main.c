@@ -3,8 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
-void show_title() {
+void show_title(void) {
     printf(
 " _______  _______  _______  __   __  _______  _______  ___      ___      _______ \n"
 "|       ||       ||       ||  | |  ||       ||       ||   |    |   |    |       |\n"
@@ -16,39 +17,17 @@ void show_title() {
     );
 }
 
-
 int main(void) {
-    Puzzle *p = puzzle_create();
-    if (!p) {
-        printf("Memory allocation failed.\n");
-        return 1;
-    }
-
     srand((unsigned)time(NULL));
-
-    /* Default words only */
-    char default_words[][MAX_WORD_LENGTH] = {
-        "QUEUE", "STACK", "GRAPH", "ALGORITHM", "SEARCH", "SORT",
-        "TREE", "NODE", "ARRAY", "DATA", "PAINT", "ROBOT",
-        "NOISE", "OFFER", "ASSET", "COURT", "STEEP", "PYTHON"
-    };
-    int default_count = sizeof(default_words) / sizeof(default_words[0]);
-
-    /* Convert them to dynamic pointers list */
-    char *word_ptrs[default_count];
-    for (int i = 0; i < default_count; ++i) {
-        word_ptrs[i] = default_words[i];
-        to_upper_inplace(word_ptrs[i]);
-    }
+    Puzzle *p = puzzle_create();
+    if (!p) { fprintf(stderr, "Failed to allocate puzzle\n"); return 1; }
 
     clear_screen();
     show_title();
 
-    printf("%s\n=== CROSSWORD GENERATOR & SOLVER ===%s\n", BOLD, RESET);
-    printf("Using default word list (%d words)...\n", default_count);
-
-    if (!puzzle_generate(p, word_ptrs, default_count)) {
-        printf("Failed to generate puzzle.\n");
+    /* Generate puzzle from BST dictionary (uses BST -> array -> generator) */
+    if (!puzzle_generate_from_bst(p)) {
+        fprintf(stderr, "Failed to generate puzzle\n");
         puzzle_free(p);
         return 1;
     }
@@ -56,17 +35,19 @@ int main(void) {
     printf("%sGenerated with %d placed words.%s\n", GREEN, p->word_count, RESET);
 
     char buf[256];
-
     for (;;) {
+        clear_screen();
+        show_title();
         printf("%s\n--- MENU ---\n%s", BOLD, RESET);
         printf("1. View puzzle (game view)\n");
         printf("2. View clues\n");
         printf("3. Input answer for a clue\n");
         printf("4. Hint (reveal one letter)\n");
-        printf("5. Check progress\n");
-        printf("6. Show solution (boxed)\n");
-        printf("7. Show timer\n");
-        printf("8. Quit\n");
+        printf("5. Undo last move\n");
+        printf("6. Check progress\n");
+        printf("7. Show solution (boxed)\n");
+        printf("8. Show timer\n");
+        printf("9. Quit\n");
         printf("Choice: ");
 
         safe_gets(buf, sizeof(buf));
@@ -74,69 +55,72 @@ int main(void) {
 
         if (opt == 1) {
             draw_grid(p, false);
-
+            printf("Press ENTER to return...");
+            getchar();
         } else if (opt == 2) {
             show_clues(p);
-
+            printf("Press ENTER to return...");
+            getchar();
         } else if (opt == 3) {
             show_clues(p);
             printf("Clue number: ");
             safe_gets(buf, sizeof(buf));
             int clue = atoi(buf);
-
             printf("Direction (A/D): ");
             safe_gets(buf, sizeof(buf));
             char d = (toupper((unsigned char)buf[0]) == 'A') ? 'A' : 'D';
-
             printf("Your answer: ");
             char ans[MAX_WORD_LENGTH];
             safe_gets(ans, sizeof(ans));
             to_upper_inplace(ans);
-
             input_answer(p, clue, d, ans);
-
             if (puzzle_solved(p)) {
                 printf("%s\nPuzzle solved! Congratulations!\n%s", GREEN, RESET);
                 draw_grid(p, true);
                 show_timer(p);
                 break;
             }
-
+            printf("Press ENTER to continue...");
+            getchar();
         } else if (opt == 4) {
             show_clues(p);
             printf("Clue number for hint: ");
             safe_gets(buf, sizeof(buf));
             int clue = atoi(buf);
-
             printf("Direction (A/D): ");
             safe_gets(buf, sizeof(buf));
             char d = (toupper((unsigned char)buf[0]) == 'A') ? 'A' : 'D';
-
             give_hint(p, clue, d);
-
             if (puzzle_solved(p)) {
                 printf("%s\nPuzzle solved! Congratulations!\n%s", GREEN, RESET);
                 draw_grid(p, true);
                 show_timer(p);
                 break;
             }
-
+            printf("Press ENTER to continue...");
+            getchar();
         } else if (opt == 5) {
+            undo_last_move(p);
+            printf("Press ENTER to continue...");
+            getchar();
+        } else if (opt == 6) {
             printf("%sCompletion: %.1f%%%s\n", BOLD, puzzle_completion(p), RESET);
             draw_grid(p, false);
-
-        } else if (opt == 6) {
-            draw_grid(p, true);
-
+            printf("Press ENTER to continue...");
+            getchar();
         } else if (opt == 7) {
-            show_timer(p);
-
+            draw_grid(p, true);
+            printf("Press ENTER to continue...");
+            getchar();
         } else if (opt == 8) {
+            show_timer(p);
+        } else if (opt == 9) {
             printf("%sGoodbye!\n%s", CYAN, RESET);
             break;
-
         } else {
             printf("%sInvalid option. Try again.%s\n", RED, RESET);
+            printf("Press ENTER to continue...");
+            getchar();
         }
     }
 
